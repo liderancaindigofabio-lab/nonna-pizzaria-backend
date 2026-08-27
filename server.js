@@ -3,7 +3,8 @@ import cors from 'cors';
 import pg from 'pg';
 const {Pool}=pg;
 const app=express(); app.use(cors()); app.use(express.json({limit:'2mb'}));
-const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.NODE_ENV==='production'?{rejectUnauthorized:false}:false});
+const pool=new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.NODE_ENV==='production'?{rejectUnauthorized:false}:false,connectionTimeoutMillis:8000,idleTimeoutMillis:10000});
+pool.on('error',function(err){console.error('database pool error',err.message)});
 const schema=`CREATE TABLE IF NOT EXISTS restaurants(id text primary key,name text not null,created_at timestamptz not null default now());
 CREATE TABLE IF NOT EXISTS users(id text primary key,restaurant_id text not null references restaurants(id),email text not null unique,name text not null,role text not null,active boolean not null default true,created_at timestamptz not null default now(),last_access_at timestamptz);
 CREATE TABLE IF NOT EXISTS products(id text primary key,restaurant_id text not null references restaurants(id),category text not null,name text not null,description text,price numeric(12,2) not null default 0,cost numeric(12,2) not null default 0,emoji text,image_url text,active boolean not null default true,updated_at timestamptz not null default now());
@@ -14,8 +15,9 @@ CREATE TABLE IF NOT EXISTS cash_movements(id text primary key,register_id text n
 CREATE TABLE IF NOT EXISTS inventory(id text primary key,restaurant_id text not null references restaurants(id),name text not null,category text,quantity numeric(12,3) not null default 0,min_quantity numeric(12,3) not null default 0,unit text not null default 'un',updated_at timestamptz not null default now());
 CREATE TABLE IF NOT EXISTS expenses(id text primary key,restaurant_id text not null references restaurants(id),description text not null,category text,amount numeric(12,2) not null check(amount>0),due_date date not null,paid boolean not null default false,created_at timestamptz not null default now());
 CREATE TABLE IF NOT EXISTS reservations(id text primary key,restaurant_id text not null references restaurants(id),customer jsonb not null default '{}',table_no text,starts_at timestamptz not null,status text not null,created_at timestamptz not null default now());`;
-let ready=pool.query(schema);
-app.get('/health',async(_,res)=>{try{await ready;res.json({ok:true,service:'nonna-pizzaria-api'})}catch(e){res.status(503).json({ok:false})}});
-app.use(async(_,res,next)=>{try{await ready;next()}catch(e){res.status(503).json({error:'database_unavailable'})}});
+let ready=null;
+async function ensureSchema(){if(!ready)ready=pool.query(schema).catch(function(err){ready=null;throw err});return ready}
+app.get('/health',async(_,res)=>{try{await ensureSchema();res.json({ok:true,service:'nonna-pizzaria-api'})}catch(e){res.status(503).json({ok:false,error:'database_unavailable'})}});
+app.use(async(_,res,next)=>{try{await ensureSchema();next()}catch(e){res.status(503).json({error:'database_unavailable'})}});
 app.get('/api/config',async(_,res)=>res.json({migration:'in_progress'}));
 app.listen(process.env.PORT||10000,()=>console.log('Nonna API listening'));
