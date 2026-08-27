@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
 import crypto from 'node:crypto';
+import { migrateFirebase } from './migration-core.mjs';
 const { Pool } = pg;
 const app = express();
 app.disable('x-powered-by');
@@ -37,6 +38,23 @@ const listRoutes = {
  products:['products',['category','name','description','price','cost','emoji','image_url','active']], inventory:['inventory',['name','category','quantity','min_quantity','unit']], expenses:['expenses',['description','category','amount','due_date','paid']], reservations:['reservations',['customer','table_no','starts_at','status']]
 };
 app.get('/health', async (_,res)=>{ try { await ensureSchema(); res.json({ok:true,service:'nonna-pizzaria-api',database:'connected'}); } catch(e){ res.status(503).json({ok:false,service:'nonna-pizzaria-api',database:'unavailable'}); } });
+// Temporary, tightly protected Firebase import endpoint. Remove after migration is confirmed.
+const migrationAuthorized = req => {
+  const expected = process.env.MIGRATION_TOKEN;
+  const supplied = req.get('x-migration-token') || (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  if (!expected || !supplied || expected.length !== supplied.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(supplied));
+};
+let lastMigration = null;
+const migrationGuard = (req, res, next) => migrationAuthorized(req) ? next() : res.status(404).json({error:'not_found'});
+app.post('/api/admin/migrate', migrationGuard, async (req,res) => {
+  try { const result = await migrateFirebase(req.body, pool); lastMigration = { ...result, completedAt: new Date().toISOString() }; res.json(lastMigration); }
+  catch (e) { console.error('Admin migration rolled back:', e.message); res.status(500).json({ok:false,error:'migration_failed'}); }
+});
+app.get('/api/admin/migrate/status', migrationGuard, async (_req,res) => {
+  try { const r = await pool.query(`SELECT json_build_object('restaurants',(SELECT count(*)::int FROM restaurants WHERE id='nonna-pizzaria'),'users',(SELECT count(*)::int FROM users WHERE restaurant_id='nonna-pizzaria'),'products',(SELECT count(*)::int FROM products WHERE restaurant_id='nonna-pizzaria'),'orders',(SELECT count(*)::int FROM orders WHERE restaurant_id='nonna-pizzaria'),'orderEvents',(SELECT count(*)::int FROM order_events e JOIN orders o ON o.id=e.order_id WHERE o.restaurant_id='nonna-pizzaria')) AS counts`); res.json({ok:true,tenant:'nonna-pizzaria',counts:r.rows[0].counts,lastMigration}); }
+  catch (e) { res.status(503).json({ok:false,error:'database_unavailable'}); }
+});
 app.get('/api/config',(req,res)=>res.json({service:'nonna-pizzaria-api',version:'1.0.0',migration:'supported'}));
 app.post('/api/auth/register', async(req,res)=>{ const {restaurantName,name,email,password}=req.body||{}; if(!restaurantName||!name||!email||!password||password.length<8) return res.status(400).json({error:'restaurantName,name,email,password(min_8) required'}); const client=await pool.connect(); try { await ensureSchema(); await client.query('BEGIN'); const rid=id(),uid=id(); const r=await client.query('INSERT INTO restaurants(id,name) VALUES($1,$2) RETURNING id,name',[rid,String(restaurantName).trim()]); await client.query('INSERT INTO users(id,restaurant_id,email,name,role,password_hash) VALUES($1,$2,lower($3),$4,$5,$6)',[uid,rid,email.trim(),name.trim(),'owner',hashPassword(password)]); await client.query('COMMIT'); res.status(201).json({token:token({uid,rid,role:'owner'}),restaurant:r.rows[0],user:{id:uid,name,email:email.toLowerCase(),role:'owner'}}); } catch(e){ await client.query('ROLLBACK').catch(()=>{}); res.status(e.code==='23505'?409:500).json({error:e.code==='23505'?'email_exists':'registration_failed'}); } finally{client.release();} });
 app.post('/api/auth/login', async(req,res)=>{ const {email,password}=req.body||{}; if(!email||!password) return res.status(400).json({error:'email,password required'}); try { const r=await q('SELECT id,restaurant_id,name,email,role,password_hash FROM users WHERE email=lower($1) AND active=true',[email]); const u=r.rows[0]; if(!u||!checkPassword(password,u.password_hash)) return res.status(401).json({error:'invalid_credentials'}); await q('UPDATE users SET last_access_at=now() WHERE id=$1',[u.id]); res.json({token:token({uid:u.id,rid:u.restaurant_id,role:u.role}),user:{id:u.id,name:u.name,email:u.email,role:u.role}}); } catch { res.status(503).json({error:'database_unavailable'}); } });
