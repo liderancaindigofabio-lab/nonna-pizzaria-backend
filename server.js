@@ -28,7 +28,7 @@ let schemaReady = false, schemaPromise;
 const id = () => crypto.randomUUID();
 const json = v => v === undefined ? {} : v;
 function hashPassword(password){ const salt=crypto.randomBytes(16).toString('hex'); return `${salt}:${crypto.scryptSync(password,salt,64).toString('hex')}`; }
-function checkPassword(password, stored){ try { const [salt,key]=stored.split(':'); return crypto.timingSafeEqual(crypto.scryptSync(password,salt,64),Buffer.from(key,'hex')); } catch { return false; } }
+function checkPassword(password, stored){ try { if(typeof stored==='string' && stored.startsWith('$2')) return bcrypt.compareSync(password,stored); const [salt,key]=stored.split(':'); return crypto.timingSafeEqual(crypto.scryptSync(password,salt,64),Buffer.from(key,'hex')); } catch { return false; } }
 function token(payload){ const body=Buffer.from(JSON.stringify({...payload,exp:Date.now()+7*86400000})).toString('base64url'); return `${body}.${crypto.createHmac('sha256',secret).update(body).digest('base64url')}`; }
 function readToken(raw){ try { const [body,sig]=raw.split('.'); const good=crypto.createHmac('sha256',secret).update(body).digest('base64url'); if(!sig||!crypto.timingSafeEqual(Buffer.from(sig),Buffer.from(good))) return null; const p=JSON.parse(Buffer.from(body,'base64url')); return p.exp>Date.now()?p:null; } catch { return null; } }
 async function ensureSchema(){ if(schemaReady) return; if(!schemaPromise) schemaPromise=(async()=>{ if(!databaseUrl) throw new Error('DATABASE_URL missing'); for(const statement of schema) await pool.query(statement); schemaReady=true; })().catch(e=>{schemaPromise=null; throw e}); return schemaPromise; }
