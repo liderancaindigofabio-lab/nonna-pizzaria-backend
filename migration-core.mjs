@@ -12,9 +12,13 @@ const money = v => Math.max(0, num(v));
 export async function migrateFirebase(source, pool) {
   source = source && typeof source === 'object' ? source : {};
   const menu = source.cardapio || source.menu || {};
-  const customers = Object.entries(source.clientes || source.customers || {}).map(([key, v]) => ({ ...(v || {}), key }));
-  const orders = Object.entries(source.pedidos || source.orders || {}).map(([key, v]) => ({ ...(v || {}), key }));
-  const motoboys = Object.entries(source.motoboys || source.couriers || {}).map(([key, v]) => ({ ...(v || {}), key }));
+  const asRecords = (value) => Array.isArray(value)
+    ? value.map((v, i) => ({ ...(v && typeof v === 'object' ? v : { value: v }), key: String(v?.key ?? v?.id ?? i) }))
+    : Object.entries(value || {}).map(([key, v]) => ({ ...(v && typeof v === 'object' ? v : { value: v }), key }));
+  const customers = asRecords(source.clientes || source.customers || source.users || source.usuarios);
+  const orders = asRecords(source.pedidos || source.orders);
+  const motoboys = asRecords(source.motoboys || source.couriers || source.entregadores);
+  const rootEvents = asRecords(source.events || source.eventos || source.orderEvents);
   const products = [];
   for (const [category, values] of Object.entries(menu)) {
     if (!Array.isArray(values) && (!values || typeof values !== 'object')) continue;
@@ -36,16 +40,17 @@ export async function migrateFirebase(source, pool) {
     }
     for (const c of customers) {
       const id = idOf(c, c.key, 'customer'); const name = String(c.nome || c.name || 'Cliente').slice(0, 120);
-      await tx.query(`INSERT INTO users(id,restaurant_id,email,name,role,active) VALUES($1,$2,$3,$4,'customer',true) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,active=true`, [id,TENANT,safeEmail(c,id),name]); counts.users++; counts.customers++; c._dbId = id;
+      await tx.query(`INSERT INTO users(id,restaurant_id,email,name,role,password_hash,active) VALUES($1,$2,$3,$4,'customer',$5,true) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,active=true`, [id,TENANT,safeEmail(c,id),name,'!legacy-import']); counts.users++; counts.customers++; c._dbId = id;
     }
     for (const m of motoboys) {
-      const id = idOf(m, m.key, 'courier'); await tx.query(`INSERT INTO users(id,restaurant_id,email,name,role,active) VALUES($1,$2,$3,$4,'courier',true) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,active=true`, [id,TENANT,safeEmail(m,id),String(m.nome||m.name||'Entregador').slice(0,120)]); counts.users++; counts.couriers++; m._dbId=id;
+      const id = idOf(m, m.key, 'courier'); await tx.query(`INSERT INTO users(id,restaurant_id,email,name,role,password_hash,active) VALUES($1,$2,$3,$4,'courier',$5,true) ON CONFLICT(id) DO UPDATE SET name=EXCLUDED.name,active=true`, [id,TENANT,safeEmail(m,id),String(m.nome||m.name||'Entregador').slice(0,120),'!legacy-import']); counts.users++; counts.couriers++; m._dbId=id;
     }
     for (const o of orders) {
       const id=idOf(o,o.key,'order'); const c=o.cliente||o.customer||{}; const tel=String(c.tel||c.telefone||o.telefone||'').replace(/\D/g,''); const known=clientByTel.get(tel); const created=iso(o.createdAt||o.criadoEm||o.created_at)||new Date().toISOString();
       const items=o.itens||o.items||[]; const subtotal=money(o.subtotal ?? o.subTotal ?? o.total); const fee=money(o.taxaEntrega ?? o.deliveryFee ?? o.delivery_fee); const total=money(o.total ?? subtotal+fee);
       await tx.query(`INSERT INTO orders(id,restaurant_id,status,channel,customer,items,subtotal,delivery_fee,total,payment,courier_id,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12) ON CONFLICT(id) DO UPDATE SET status=EXCLUDED.status,channel=EXCLUDED.channel,customer=EXCLUDED.customer,items=EXCLUDED.items,subtotal=EXCLUDED.subtotal,delivery_fee=EXCLUDED.delivery_fee,total=EXCLUDED.total,payment=EXCLUDED.payment,courier_id=EXCLUDED.courier_id,updated_at=EXCLUDED.updated_at`, [id,TENANT,statuses[o.status]||o.status||'new',o.channel||'legacy-firebase',json({...c,customerUid:o.customerUid||o.clienteId||(known && known._dbId)||null}),json(items),subtotal,fee,total,json(o.pagamento||o.payment||{}),o.motoboyId||o.courierUid||null,created]); counts.orders++;
-      for (const ev of arr(o.timeline||o.events||[])) { const eid=`${id}:${idOf(ev,ev.key,'event')}`; await tx.query(`INSERT INTO order_events(id,order_id,status,actor_id,metadata,created_at) VALUES((abs(hashtext($1))::bigint),$2,$3,$4,$5,$6) ON CONFLICT(id) DO NOTHING`,[eid,id,statuses[ev.status]||ev.status||'new',ev.actorId||ev.actor||null,json(ev),iso(ev.timestamp||ev.createdAt)||created]); counts.orderEvents++; }
+      const orderEvents = arr(o.timeline || o.events || []).concat(rootEvents.filter(ev => String(ev.orderId ?? ev.pedidoId ?? ev.order_key ?? '') === String(o.key) || String(ev.orderId ?? '') === id));
+      for (const ev of orderEvents) { const eid=`${id}:${idOf(ev,ev.key,'event')}`; await tx.query(`INSERT INTO order_events(id,order_id,status,actor_id,metadata,created_at) VALUES((abs(hashtext($1))::bigint),$2,$3,$4,$5,$6) ON CONFLICT(id) DO NOTHING`,[eid,id,statuses[ev.status]||ev.status||'new',ev.actorId||ev.actor||null,json(ev),iso(ev.timestamp||ev.createdAt)||created]); counts.orderEvents++; }
     }
     await tx.query('COMMIT');
     const verify = await pool.query(`SELECT 'products' entity,count(*)::int count FROM products WHERE restaurant_id=$1 UNION ALL SELECT 'users',count(*)::int FROM users WHERE restaurant_id=$1 UNION ALL SELECT 'orders',count(*)::int FROM orders WHERE restaurant_id=$1 UNION ALL SELECT 'order_events',count(*)::int FROM order_events e JOIN orders o ON o.id=e.order_id WHERE o.restaurant_id=$1`, [TENANT]);
