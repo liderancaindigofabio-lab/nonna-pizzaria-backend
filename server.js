@@ -97,5 +97,35 @@ app.get('/api/admin/migrate/status', migrationGuard, async (_req,res) => {
     res.json({ok:true,tenant:'nonna-pizzaria',counts:q.rows[0].counts,lastMigration});
   } catch (e) { res.status(503).json({ok:false,error:'database_unavailable'}); }
 });
+// Public authentication endpoint for the Nonna operational panels.
+function issueToken(payload) {
+  const body = Buffer.from(JSON.stringify({ ...payload, exp: Date.now() + 7 * 86400000 })).toString('base64url');
+  const secret = process.env.SESSION_SECRET || process.env.JWT_SECRET || 'nonna-session-secret';
+  const sig = crypto.createHmac('sha256', secret).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+app.post('/api/auth/login', async (req, res) => {
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  if (!email || !password) return res.status(400).json({ error: 'email,password required' });
+  try {
+    const result = await pool.query(
+      'SELECT id,restaurant_id,name,email,role,password_hash FROM users WHERE email=lower($1) AND active=true',
+      [email]
+    );
+    const user = result.rows[0];
+    if (!user || !await bcrypt.compare(password, user.password_hash)) {
+      return res.status(401).json({ error: 'invalid_credentials' });
+    }
+    await pool.query('UPDATE users SET last_access_at=now() WHERE id=$1', [user.id]);
+    return res.json({
+      token: issueToken({ uid: user.id, rid: user.restaurant_id, role: user.role }),
+      user: { id: user.id, name: user.name, email: user.email, role: user.role }
+    });
+  } catch (e) {
+    console.error('Login failed:', e.message);
+    return res.status(503).json({ error: 'database_unavailable' });
+  }
+});
 app.get('/api/config',async(_,res)=>res.json({migration:'in_progress'}));
 app.listen(process.env.PORT||10000,()=>console.log('Nonna API listening'));
